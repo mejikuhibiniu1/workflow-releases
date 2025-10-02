@@ -1,0 +1,186 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Claim {
+  id            Int       @id @default(autoincrement())
+  orderId       String
+  productId     Int
+  remaining     Int       @default(0)
+  appIds        String[]
+  lastClaimedAt DateTime?
+  updatedAt     DateTime  @default(now())
+  createdAt     DateTime
+  product       Product   @relation(fields: [productId], references: [id])
+
+  @@unique([orderId, productId])
+  @@map("claims")
+}
+
+model Product {
+  id                    Int              @id @default(autoincrement())
+  name                  String
+  varname               String           @default("")
+  content               String?
+  linkedOrderId         String?
+  claimType             ProductClaimType
+  defaultClaimRemaining Int              @default(0)
+  appIds                String[]
+  claims                Claim[]
+
+  @@unique([name, varname])
+  @@map("products")
+}
+
+model Game {
+  id             Int             @id @default(autoincrement())
+  appid          String          @unique
+  name           String
+  metaDataInfo   Json?
+  updatedAt      DateTime        @default(now())
+  patchUpdatedAt String?
+  hasManifest    Boolean         @default(false)
+  isFree         Boolean         @default(false)
+  releaseDate    DateTime?
+  hotGames       hotGames?
+  onlineFixes    onlineFixes?
+  sharedAccounts SharedAccount[]
+
+  @@map("games")
+}
+
+model Account {
+  id            Int       @id @default(autoincrement())
+  orderId       String    @unique
+  hwids         String[]
+  isPremium     Boolean
+  createdAt     DateTime? @default(now())
+  lastAddGameAt DateTime?
+  lastLoginAt   DateTime?
+  updatedAt     DateTime  @default(now())
+  maxDevices    Int       @default(2)
+  hwids_history String[]
+  seller        String    @default("cyberspace")
+  isBlocked     Boolean?  @default(false)
+  expiredAt     DateTime  @default(dbgenerated("'2999-12-12 00:00:00'::timestamp without time zone")) @db.Timestamp(6)
+  allowedAppids String[]
+  isAdmin       Boolean?  @default(false)
+
+  @@map("accounts")
+}
+
+model GeneralParameter {
+  id   Int    @id @default(autoincrement())
+  name String @unique
+  data Json
+}
+
+model Membership {
+  id                         Int       @id @default(autoincrement())
+  orderId                    String    @unique
+  hwids                      String[]
+  hwids_history              String[]
+  accountSharing             Boolean?  @default(false)
+  lastChangeAccountSharingAt DateTime?
+  createdAt                  DateTime? @default(now()) @db.Timestamptz(6)
+  accountSharingExpiredAt    DateTime? @db.Timestamp(6)
+  maxDevices                 Int       @default(0)
+  updatedAt                  DateTime? @default(now()) @db.Timestamp(6)
+
+  @@map("memberships")
+}
+
+model SharedAccount {
+  id            BigInt    @id @default(autoincrement())
+  appid         String
+  gameName      String
+  metaDataInfo  Json?
+  accounts      Json[]
+  isActive      Boolean?  @default(true)
+  createdAt     DateTime? @default(now()) @db.Timestamp(6)
+  updatedAt     DateTime? @default(now()) @db.Timestamp(6)
+  isSteamGuard  Boolean?  @default(false)
+  sourceAccount String?
+  categories    String[]
+  ubisoftAppid  String?
+  denuvoToken   String?
+  game          Game      @relation(fields: [appid], references: [appid])
+
+  @@unique([appid, gameName])
+  @@map("sharedAccounts")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model depotKeys {
+  id         BigInt    @id @default(autoincrement())
+  depotId    String    @unique
+  depotKey   String?
+  created_at DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at DateTime? @default(now()) @db.Timestamptz(6)
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model hotGames {
+  id         BigInt   @id @default(autoincrement())
+  appid      String   @unique
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+  game       Game     @relation(fields: [appid], references: [appid], onUpdate: NoAction)
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model maintenances {
+  id             BigInt   @id @default(autoincrement())
+  path           String   @unique
+  isMaintenance  Boolean  @default(false)
+  title          String   @default("Scheduled Maintenance in Progress")
+  message        String?  @default("\\u003Cp\\u003EWe’re currently performing routine maintenance to improve stability and performance.\\u003Cbr\\u003E\\u003Cbr\\u003E Some features may be temporarily unavailable during this period.\\u003Cbr\\u003E\\u003Cbr\\u003E Thank you for your patience and understanding — we’ll be back shortly!\\u003C/p\\u003E")
+  created_at     DateTime @default(now()) @db.Timestamptz(6)
+  minimumVersion String?
+}
+
+model MembershipPlan {
+  id            Int      @id @default(autoincrement())
+  code          String   @unique
+  name          String
+  description   String?
+  duration      Int?
+  price         Decimal  @db.Decimal(10, 2)
+  currency      String   @default("IDR")
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  originalPrice Decimal? @db.Decimal(10, 2)
+
+  @@map("membership_plans")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model onlineFixes {
+  id            BigInt    @id(map: "onlineFix_pkey") @default(autoincrement())
+  appid         String    @unique(map: "onlineFix_appid_key")
+  urls          String[]
+  description   String?
+  created_at    DateTime  @default(now()) @db.Timestamptz(6)
+  updated_at    DateTime? @default(now()) @db.Timestamp(6)
+  category      String?
+  forMembership Boolean?  @default(false)
+  games         Game      @relation(fields: [appid], references: [appid], map: "onlineFix_appid_fkey")
+}
+
+enum ProductClaimType {
+  account
+  link
+  accessApp
+  accessAppPremium
+  accessAppMembership_1month
+  accessAppMembership_1year
+  accessAppMembership_6month
+  membership_3month
+  membership_1year
+  accessAppLimited
+}

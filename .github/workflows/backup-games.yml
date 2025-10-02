@@ -1,0 +1,171 @@
+name: Backup Games Database
+
+on:
+  schedule:
+    # Run every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  backup-games:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: |
+          npm install @prisma/client
+          npm install prisma
+
+      - name: Generate Prisma Client
+        run: npx prisma generate
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      - name: Check if update needed
+        id: check-update
+        run: |
+          # Cek apakah ada perubahan di games table
+          CURRENT_COUNT=$(node -e "
+          const { PrismaClient } = require('@prisma/client');
+          async function getCount() {
+            const prisma = new PrismaClient();
+            const count = await prisma.game.count();
+            console.log(count);
+            await prisma.\$disconnect();
+          }
+          getCount();
+          ")
+
+          # Cek count terakhir
+          LAST_COUNT=0
+          if [ -f "public/data/games.json" ]; then
+            LAST_COUNT=$(cat public/data/games.json | jq '.totalGames // 0')
+          fi
+
+          echo "current_count=$CURRENT_COUNT" >> $GITHUB_OUTPUT
+          echo "last_count=$LAST_COUNT" >> $GITHUB_OUTPUT
+          echo "needs_update=$([[ $CURRENT_COUNT != $LAST_COUNT ]] && echo true || echo false)" >> $GITHUB_OUTPUT
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      - name: Export Games to JSON
+        run: |
+          # Create filename with date and hour
+          DATE_HOUR=$(date '+%d%m%Y_%H')
+          FILENAME="games-${DATE_HOUR}.json"
+          FILENAME_MIN="games-${DATE_HOUR}.min.json"
+
+          echo "filename=${FILENAME}" >> $GITHUB_ENV
+          echo "filename_min=${FILENAME_MIN}" >> $GITHUB_ENV
+
+          node -e "
+          const { PrismaClient } = require('@prisma/client');
+          const fs = require('fs');
+
+          async function exportGames() {
+            const prisma = new PrismaClient();
+
+            try {
+              const games = await prisma.game.findMany({
+                select: {
+                  id: true,
+                  appid: true,
+                  name: true,
+                  metaDataInfo: true,
+                  hasManifest: true,
+                  isFree: true,
+                  releaseDate: true,
+                  updatedAt: true,
+                  patchUpdatedAt: true
+                },
+                orderBy: { name: 'asc' }
+              });
+
+              const database = {
+                version: new Date().toISOString(),
+                totalGames: games.length,
+                lastUpdated: new Date().toISOString(),
+                games: games
+              };
+
+              const filename = process.env.FILENAME || '${FILENAME}';
+              const filenameMin = process.env.FILENAME_MIN || '${FILENAME_MIN}';
+
+              // Write files with timestamped names
+              fs.writeFileSync(filename, JSON.stringify(database, null, 2));
+              fs.writeFileSync(filenameMin, JSON.stringify(database));
+
+              // Also create latest.json for easy access
+              fs.writeFileSync('games-latest.json', JSON.stringify(database));
+
+              console.log(\`Exported \${games.length} games to \${filename}\`);
+            } catch (error) {
+              console.error('Export failed:', error);
+              process.exit(1);
+            } finally {
+              await prisma.\$disconnect();
+            }
+          }
+
+          exportGames();
+          "
+        env:
+          FILENAME: ${{ env.filename }}
+          FILENAME_MIN: ${{ env.filename_min }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      - name: Delete old release assets
+        run: |
+          # Get existing release assets and delete them
+          gh release view games-database --json assets --jq '.assets[].name' > old_assets.txt || echo "No existing release"
+
+          if [ -f old_assets.txt ] && [ -s old_assets.txt ]; then
+            echo "Deleting old assets..."
+            while read asset; do
+              echo "Deleting: $asset"
+              gh release delete-asset games-database "$asset" --yes || echo "Failed to delete $asset"
+            done < old_assets.txt
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: games-database
+          name: "Games Database"
+          body: |
+            🎮 Games Database Export
+
+            **Stats:**
+            - Total Games: ${{ steps.check-update.outputs.current_count }}
+            - Updated: $(date '+%Y-%m-%d %H:%M UTC')
+
+            **Files:**
+            - `${{ env.filename }}` - Formatted JSON (timestamped)
+            - `${{ env.filename_min }}` - Minified JSON (timestamped)
+            - `games-latest.json` - Always latest version
+
+            **Usage:**
+            ```javascript
+            const games = await fetch('https://github.com/cyberspace-ops/cyberspacestore/releases/download/games-database/games-latest.json')
+              .then(res => res.json());
+            ```
+          files: |
+            ${{ env.filename }}
+            ${{ env.filename_min }}
+            games-latest.json
+          prerelease: false
+          make_latest: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

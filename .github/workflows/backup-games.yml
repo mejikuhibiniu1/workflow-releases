@@ -116,6 +116,33 @@ jobs:
               };
               fs.writeFileSync('version.json', JSON.stringify(versionInfo, null, 2));
 
+              // Extract and create genres.json
+              const genresMap = new Map();
+              games.forEach(game => {
+                if (game.metaDataInfo && game.metaDataInfo.genres) {
+                  game.metaDataInfo.genres.forEach(genre => {
+                    if (genre.id && genre.description) {
+                      if (!genresMap.has(genre.id)) {
+                        genresMap.set(genre.id, {
+                          id: genre.id,
+                          description: genre.description,
+                          count: 0
+                        });
+                      }
+                      genresMap.get(genre.id).count++;
+                    }
+                  });
+                }
+              });
+
+              const genresData = {
+                version: new Date().toISOString(),
+                totalGenres: genresMap.size,
+                lastUpdated: new Date().toISOString(),
+                genres: Array.from(genresMap.values()).sort((a, b) => b.count - a.count)
+              };
+              fs.writeFileSync('genres.json', JSON.stringify(genresData, null, 2));
+
               console.log(\`Exported \${games.length} games to \${filename}\`);
             } catch (error) {
               console.error('Export failed:', error);
@@ -164,14 +191,19 @@ jobs:
             - `${{ env.filename_min }}` - Minified JSON (timestamped)
             - `games-latest.json` - Always latest version
             - `version.json` - Version information only
+            - `genres.json` - All genres with game counts
 
             **Usage:**
             ```javascript
-            const games = await fetch('https://github.com/cyberspace-ops/cyberspacestore/releases/download/games-database/games-latest.json')
+            const games = await fetch('https://github.com/mejikuhibiniu1/workflow-releases/releases/download/games-database/games-latest.json')
               .then(res => res.json());
 
             // Check version
-            const version = await fetch('https://github.com/cyberspace-ops/cyberspacestore/releases/download/games-database/version.json')
+            const version = await fetch('https://github.com/mejikuhibiniu1/workflow-releases/releases/download/games-database/version.json')
+              .then(res => res.json());
+
+            // Get genres
+            const genres = await fetch('https://github.com/mejikuhibiniu1/workflow-releases/releases/download/games-database/genres.json')
               .then(res => res.json());
             ```
           files: |
@@ -179,6 +211,7 @@ jobs:
             ${{ env.filename_min }}
             games-latest.json
             version.json
+            genres.json
           prerelease: false
           make_latest: false
         env:

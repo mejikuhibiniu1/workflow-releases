@@ -108,6 +108,14 @@ jobs:
               // Also create latest.json for easy access
               fs.writeFileSync('games-latest.json', JSON.stringify(database));
 
+              // Create version.json
+              const versionInfo = {
+                version: database.version,
+                totalGames: database.totalGames,
+                lastUpdated: database.lastUpdated
+              };
+              fs.writeFileSync('version.json', JSON.stringify(versionInfo, null, 2));
+
               console.log(\`Exported \${games.length} games to \${filename}\`);
             } catch (error) {
               console.error('Export failed:', error);
@@ -155,16 +163,22 @@ jobs:
             - `${{ env.filename }}` - Formatted JSON (timestamped)
             - `${{ env.filename_min }}` - Minified JSON (timestamped)
             - `games-latest.json` - Always latest version
+            - `version.json` - Version information only
 
             **Usage:**
             ```javascript
             const games = await fetch('https://github.com/cyberspace-ops/cyberspacestore/releases/download/games-database/games-latest.json')
+              .then(res => res.json());
+
+            // Check version
+            const version = await fetch('https://github.com/cyberspace-ops/cyberspacestore/releases/download/games-database/version.json')
               .then(res => res.json());
             ```
           files: |
             ${{ env.filename }}
             ${{ env.filename_min }}
             games-latest.json
+            version.json
           prerelease: false
           make_latest: false
         env:

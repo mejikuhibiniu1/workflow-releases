@@ -2,7 +2,7 @@ name: Backup Games Database
 
 on:
   schedule:
-    # Run every 6 hours
+    # Run every 1 hour
     - cron: '0 */1 * * *'
   workflow_dispatch: # Allow manual trigger
 

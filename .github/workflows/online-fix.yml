@@ -1,0 +1,532 @@
+name: Scrape Online-Fix Games
+
+on:
+  schedule:
+    # Run every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # Allow manual trigger
+    inputs:
+      pages:
+        description: 'Number of pages to scrape'
+        required: false
+        default: '5'
+      fetch_appids:
+        description: 'Fetch Steam AppIDs (slower)'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  scrape-online-fix:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: |
+          npm install axios cheerio @prisma/client prisma
+
+      - name: Generate Prisma Client
+        run: npx prisma generate
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      - name: Scrape Online-Fix Games
+        id: scrape
+        run: |
+          # Create scraper script
+          cat > scrape-online-fix.js << 'EOF'
+          const axios = require('axios');
+          const cheerio = require('cheerio');
+          const fs = require('fs');
+
+          // Cookies from environment
+          const COOKIES = {
+            online_fix_auth: process.env.ONLINE_FIX_AUTH || '',
+            dle_user_id: process.env.ONLINE_FIX_DLE_USER_ID || '',
+            dle_password: process.env.ONLINE_FIX_DLE_PASSWORD || '',
+            PHPSESSID: process.env.ONLINE_FIX_PHPSESSID || '',
+            cf_clearance: process.env.ONLINE_FIX_CF_CLEARANCE || '',
+          };
+
+          const cookieString = `online_fix_auth=${COOKIES.online_fix_auth}; dle_user_id=${COOKIES.dle_user_id}; dle_password=${COOKIES.dle_password}; PHPSESSID=${COOKIES.PHPSESSID}; cf_clearance=${COOKIES.cf_clearance}`;
+
+          const headers = {
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br, zstd',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Cache-Control': 'max-age=0',
+            Cookie: cookieString,
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
+          };
+
+          function cleanText(text) {
+            if (!text) return '';
+            return text
+              .replace(/[\u{1F300}-\u{1F9FF}]/gu, '')
+              .replace(/[\u{2600}-\u{26FF}]/gu, '')
+              .replace(/[\u{2700}-\u{27BF}]/gu, '')
+              .replace(/�/g, '')
+              .replace(/\s+/g, ' ')
+              .trim();
+          }
+
+          async function searchGameInDatabase(gameName) {
+            try {
+              const { PrismaClient } = require('@prisma/client');
+              const prisma = new PrismaClient();
+
+              const cleanName = gameName
+                .replace(/\s*-\s*online[-\s]?fix/gi, '')
+                .replace(/\([^)]*\)/g, '')
+                .trim();
+
+              let game = await prisma.game.findFirst({
+                where: { name: { equals: cleanName, mode: 'insensitive' } },
+                select: { appid: true, name: true },
+              });
+
+              if (!game) {
+                game = await prisma.game.findFirst({
+                  where: { name: { contains: cleanName, mode: 'insensitive' } },
+                  select: { appid: true, name: true },
+                });
+              }
+
+              await prisma.$disconnect();
+              return game?.appid || null;
+            } catch (error) {
+              console.log(`Database search error: ${error.message}`);
+              return null;
+            }
+          }
+
+          async function extractAppId(gameUrl, gameTitle) {
+            try {
+              const response = await axios.get(gameUrl, {
+                headers,
+                maxRedirects: 5,
+                validateStatus: (status) => status < 600,
+                timeout: 15000,
+                responseType: 'arraybuffer',
+              });
+
+              if (response.status !== 200) return null;
+
+              const decoder = new TextDecoder('utf-8');
+              const html = decoder.decode(response.data);
+              const $ = cheerio.load(html);
+
+              let appid = null;
+
+              $('a[href*="store.steampowered.com/app/"]').each((i, elem) => {
+                const href = $(elem).attr('href');
+                const match = href?.match(/\/app\/(\d+)/);
+                if (match) {
+                  appid = match[1];
+                  return false;
+                }
+              });
+
+              if (!appid) {
+                $('a[href*="steamdb.info/app/"]').each((i, elem) => {
+                  const href = $(elem).attr('href');
+                  const match = href?.match(/\/app\/(\d+)/);
+                  if (match) {
+                    appid = match[1];
+                    return false;
+                  }
+                });
+              }
+
+              if (!appid) {
+                const bodyText = $('body').text();
+                const match = bodyText.match(/(?:AppID|App ID|Steam ID)[\s:]+(\d{4,7})/i);
+                if (match) appid = match[1];
+              }
+
+              if (!appid && gameTitle) {
+                console.log(`  Searching database for: ${gameTitle}`);
+                appid = await searchGameInDatabase(gameTitle);
+                if (appid) console.log(`  Found in DB: ${appid}`);
+              }
+
+              return appid;
+            } catch (error) {
+              console.log(`Error extracting AppID: ${error.message}`);
+              return null;
+            }
+          }
+
+          async function scrapePage(pageNumber, fetchAppIds) {
+            try {
+              const url = pageNumber === 1 ? 'https://online-fix.me/' : `https://online-fix.me/page/${pageNumber}/`;
+              console.log(`Scraping page ${pageNumber}: ${url}`);
+
+              const response = await axios.get(url, {
+                headers,
+                maxRedirects: 5,
+                validateStatus: (status) => status < 600,
+                timeout: 30000,
+                responseType: 'arraybuffer',
+              });
+
+              if (response.status !== 200) {
+                console.log(`Failed to fetch page ${pageNumber}`);
+                return null;
+              }
+
+              const decoder = new TextDecoder('utf-8');
+              const html = decoder.decode(response.data);
+              const $ = cheerio.load(html);
+              const games = [];
+
+              $('article').each((i, elem) => {
+                const $elem = $(elem);
+                const rawTitle = $elem.find('h2, h3, .title, .post-title').first().text().trim();
+                const title = cleanText(rawTitle);
+                const link = $elem.find('a').first().attr('href');
+                if (title && link) games.push({ title, link, appid: null });
+              });
+
+              if (games.length === 0) {
+                $('.post, .game-post, .entry').each((i, elem) => {
+                  const $elem = $(elem);
+                  const rawTitle = $elem.find('h2, h3, .title, .post-title').first().text().trim();
+                  const title = cleanText(rawTitle);
+                  const link = $elem.find('a').first().attr('href');
+                  if (title && link) games.push({ title, link, appid: null });
+                });
+              }
+
+              if (games.length === 0) {
+                $('a[href*="/index.php"]').each((i, elem) => {
+                  const $elem = $(elem);
+                  const rawTitle = $elem.text().trim();
+                  const title = cleanText(rawTitle);
+                  const link = $elem.attr('href');
+                  if (title && link && title.length > 10 && !title.toLowerCase().includes('next') && !title.toLowerCase().includes('previous')) {
+                    games.push({ title, link, appid: null });
+                  }
+                });
+              }
+
+              console.log(`Found ${games.length} games on page ${pageNumber}`);
+
+              if (fetchAppIds && games.length > 0) {
+                console.log('Extracting Steam AppIDs...');
+                for (let i = 0; i < games.length; i++) {
+                  const game = games[i];
+                  console.log(`[${i + 1}/${games.length}] ${game.title}`);
+                  const appid = await extractAppId(game.link, game.title);
+                  game.appid = appid;
+                  if (appid) console.log(`  AppID: ${appid}`);
+                  if (i < games.length - 1) await new Promise(r => setTimeout(r, 1000));
+                }
+              }
+
+              return { pageNumber, games, hasGames: games.length > 0 };
+            } catch (error) {
+              console.log(`Error scraping page ${pageNumber}: ${error.message}`);
+              return null;
+            }
+          }
+
+          async function loadExistingGames() {
+            try {
+              const { PrismaClient } = require('@prisma/client');
+              const prisma = new PrismaClient();
+
+              console.log('Loading existing games from onlineFixes table...');
+
+              const existingGames = await prisma.onlineFixes.findMany({
+                select: {
+                  appid: true,
+                  games: {
+                    select: {
+                      name: true,
+                    },
+                  },
+                },
+              });
+
+              await prisma.$disconnect();
+
+              // Create Sets for O(1) lookup performance
+              const existingAppIds = new Set(existingGames.map(g => g.appid));
+
+              // Normalize game names for comparison (lowercase, remove special chars)
+              const normalizeGameName = (name) => {
+                return name
+                  .toLowerCase()
+                  .replace(/[^a-z0-9]/g, '') // Remove non-alphanumeric
+                  .trim();
+              };
+
+              const existingGameNames = new Set(
+                existingGames
+                  .filter(g => g.games?.name) // Only games with names
+                  .map(g => normalizeGameName(g.games.name))
+              );
+
+              console.log(`Loaded ${existingAppIds.size} existing AppIDs and ${existingGameNames.size} game names`);
+
+              return { existingAppIds, existingGameNames, normalizeGameName };
+            } catch (error) {
+              console.log(`Error loading existing games: ${error.message}`);
+              return { existingAppIds: new Set(), existingGameNames: new Set(), normalizeGameName: (n) => n }; // Return empty sets if error
+            }
+          }
+
+          async function insertGamesToDatabase(games) {
+            try {
+              const { PrismaClient } = require('@prisma/client');
+              const prisma = new PrismaClient();
+
+              console.log(`\n📝 Inserting ${games.length} games into onlineFixes table...`);
+
+              let inserted = 0;
+              let skipped = 0;
+              let errors = 0;
+
+              for (const game of games) {
+                // Skip games without AppID
+                if (!game.appid) {
+                  console.log(`  ⏭️  Skipping ${game.title} (no AppID)`);
+                  skipped++;
+                  continue;
+                }
+
+                try {
+                  // Check if game exists in games table first
+                  const gameExists = await prisma.game.findUnique({
+                    where: { appid: game.appid },
+                    select: { appid: true },
+                  });
+
+                  if (!gameExists) {
+                    console.log(`  ⚠️  Game not found in games table: ${game.title} (AppID: ${game.appid})`);
+                    skipped++;
+                    continue;
+                  }
+
+                  // Construct the online-fix URL
+                  const onlineFixUrl = `https://uploads.online-fix.me:2053/uploads/${game.title.replace(/:/g, '').trim().replace(/ /g, '%20')}/Fix%20Repair/`;
+
+                  // Upsert into onlineFixes table
+                  await prisma.onlineFixes.upsert({
+                    where: { appid: game.appid },
+                    create: {
+                      appid: game.appid,
+                      urls: [onlineFixUrl],
+                      description: null,
+                      category: 'WEB_ONLINE_FIX',
+                      forMembership: false,
+                    },
+                    update: {
+                      urls: [onlineFixUrl],
+                      updated_at: new Date(),
+                    },
+                  });
+
+                  console.log(`  ✅ Inserted/Updated: ${game.title} (AppID: ${game.appid})`);
+                  inserted++;
+                } catch (error) {
+                  console.log(`  ❌ Error with ${game.title}: ${error.message}`);
+                  errors++;
+                }
+              }
+
+              await prisma.$disconnect();
+
+              console.log(`\n📊 Database Insertion Summary:`);
+              console.log(`  ✅ Inserted/Updated: ${inserted}`);
+              console.log(`  ⏭️  Skipped: ${skipped}`);
+              console.log(`  ❌ Errors: ${errors}`);
+
+              return { inserted, skipped, errors };
+            } catch (error) {
+              console.log(`\n❌ Database insertion failed: ${error.message}`);
+              return { inserted: 0, skipped: 0, errors: games.length };
+            }
+          }
+
+          async function main() {
+            const maxPages = parseInt(process.env.MAX_PAGES || '5');
+            const fetchAppIds = process.env.FETCH_APPIDS === 'true';
+
+            console.log(`Scraping ${maxPages} pages (AppIDs: ${fetchAppIds})`);
+
+            // Load existing games once at the start
+            const { existingAppIds, existingGameNames, normalizeGameName } = await loadExistingGames();
+
+            const allGames = [];
+            let totalGames = 0;
+            let skippedGames = 0;
+
+            for (let page = 1; page <= maxPages; page++) {
+              const result = await scrapePage(page, fetchAppIds);
+              if (result && result.hasGames) {
+                // Filter out existing games
+                const newGames = result.games.filter(game => {
+                  // Check by AppID first
+                  if (game.appid && existingAppIds.has(game.appid)) {
+                    console.log(`  ⏭️  Skipping existing (AppID): ${game.title} (AppID: ${game.appid})`);
+                    skippedGames++;
+                    return false;
+                  }
+
+                  // Check by normalized game name
+                  const normalizedTitle = normalizeGameName(game.title);
+                  if (existingGameNames.has(normalizedTitle)) {
+                    console.log(`  ⏭️  Skipping existing (Name): ${game.title}`);
+                    skippedGames++;
+                    return false;
+                  }
+
+                  return true;
+                });
+
+                result.games = newGames;
+
+                if (newGames.length > 0) {
+                  allGames.push(result);
+                  totalGames += newGames.length;
+                }
+              } else {
+                break;
+              }
+              if (page < maxPages) await new Promise(r => setTimeout(r, 2000));
+            }
+
+            const flatGames = allGames.flatMap(r => r.games);
+
+            console.log(`\nFiltered Results:`);
+            console.log(`  Total scraped: ${totalGames + skippedGames}`);
+            console.log(`  Skipped (existing): ${skippedGames}`);
+            console.log(`  New games: ${totalGames}`);
+
+            // Insert new games into database
+            if (flatGames.length > 0) {
+              await insertGamesToDatabase(flatGames);
+            }
+
+            const jsonData = {
+              version: new Date().toISOString(),
+              totalPages: allGames.length,
+              totalGames: totalGames,
+              lastUpdated: new Date().toISOString(),
+              pages: allGames,
+              games: flatGames,
+            };
+
+            fs.writeFileSync('online-fix-games.json', JSON.stringify(jsonData, null, 2));
+            fs.writeFileSync('online-fix-games.min.json', JSON.stringify(jsonData));
+
+            const versionInfo = {
+              version: jsonData.version,
+              totalPages: jsonData.totalPages,
+              totalGames: jsonData.totalGames,
+              lastUpdated: jsonData.lastUpdated,
+            };
+            fs.writeFileSync('online-fix-version.json', JSON.stringify(versionInfo, null, 2));
+
+            console.log(`\nScraped ${totalGames} games from ${allGames.length} pages`);
+            console.log(`TOTAL_GAMES=${totalGames}` >> process.env.GITHUB_OUTPUT);
+          }
+
+          main().catch(console.error);
+          EOF
+
+          # Run scraper
+          node scrape-online-fix.js
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ONLINE_FIX_AUTH: ${{ secrets.ONLINE_FIX_AUTH }}
+          ONLINE_FIX_DLE_USER_ID: ${{ secrets.ONLINE_FIX_DLE_USER_ID }}
+          ONLINE_FIX_DLE_PASSWORD: ${{ secrets.ONLINE_FIX_DLE_PASSWORD }}
+          ONLINE_FIX_PHPSESSID: ${{ secrets.ONLINE_FIX_PHPSESSID }}
+          ONLINE_FIX_CF_CLEARANCE: ${{ secrets.ONLINE_FIX_CF_CLEARANCE }}
+          MAX_PAGES: ${{ github.event.inputs.pages || '5' }}
+          FETCH_APPIDS: ${{ github.event.inputs.fetch_appids || 'true' }}
+
+      - name: Delete old release assets
+        run: |
+          gh release view online-fix-games --json assets --jq '.assets[].name' > old_assets.txt || echo "No existing release"
+
+          if [ -f old_assets.txt ] && [ -s old_assets.txt ]; then
+            echo "Deleting old assets..."
+            while read asset; do
+              echo "Deleting: $asset"
+              gh release delete-asset online-fix-games "$asset" --yes || echo "Failed to delete $asset"
+            done < old_assets.txt
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: online-fix-games
+          name: 'Online-Fix Games Database'
+          body: |
+            🎮 Online-Fix Games Database
+
+            **Stats:**
+            - Total Games: ${{ steps.scrape.outputs.TOTAL_GAMES }}
+            - Total Pages: ${{ github.event.inputs.pages || '5' }}
+            - Updated: ${{ steps.scrape.outputs.LAST_UPDATED }}
+            - AppIDs Included: ${{ github.event.inputs.fetch_appids || 'true' }}
+
+            **Files:**
+            - `online-fix-games.json` - Formatted JSON with all games
+            - `online-fix-games.min.json` - Minified JSON
+            - `online-fix-version.json` - Version information only
+
+            **Usage:**
+            ```javascript
+            // Fetch all games
+            const data = await fetch('https://github.com/mejikuhibiniu1/workflow-releases/releases/download/online-fix-games/online-fix-games.json')
+              .then(res => res.json());
+
+            console.log(`Total games: ${data.totalGames}`);
+            console.log(`Games:`, data.games);
+
+            // Check version
+            const version = await fetch('https://github.com/mejikuhibiniu1/workflow-releases/releases/download/online-fix-games/online-fix-version.json')
+              .then(res => res.json());
+            ```
+
+            **Data Structure:**
+            ```json
+            {
+              "version": "2025-10-25T10:00:00.000Z",
+              "totalPages": 5,
+              "totalGames": 100,
+              "lastUpdated": "2025-10-25T10:00:00.000Z",
+              "games": [
+                {
+                  "title": "Game Name",
+                  "link": "https://online-fix.me/games/...",
+                  "appid": "123456"
+                }
+              ]
+            }
+            ```
+          files: |
+            online-fix-games.json
+            online-fix-games.min.json
+            online-fix-version.json
+          prerelease: false
+          make_latest: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

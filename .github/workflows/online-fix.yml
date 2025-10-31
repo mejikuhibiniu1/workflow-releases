@@ -8,7 +8,7 @@ on:
       pages:
         description: 'Number of pages to scrape'
         required: false
-        default: '5'
+        default: '2'
       fetch_appids:
         description: 'Fetch Steam AppIDs (slower)'
         required: false

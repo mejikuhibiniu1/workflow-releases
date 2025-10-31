@@ -32,7 +32,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          npm install axios cheerio @prisma/client prisma
+          npm install axios cheerio @prisma/client prisma algoliasearch
 
       - name: Generate Prisma Client
         run: npx prisma generate
@@ -47,6 +47,7 @@ jobs:
           const axios = require('axios');
           const cheerio = require('cheerio');
           const fs = require('fs');
+          const { algoliasearch } = require('algoliasearch');
 
           // Cookies from environment
           const COOKIES = {
@@ -67,6 +68,26 @@ jobs:
             Cookie: cookieString,
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
           };
+
+          // Initialize Algolia client
+          let algoliaClient = null;
+          let algoliaIndexName = process.env.NEXT_PUBLIC_ALGOLIA_INDEX_NAME || 'games';
+
+          function getAlgoliaClient() {
+            if (!algoliaClient) {
+              const appId = process.env.NEXT_PUBLIC_ALGOLIA_APP_ID;
+              const apiKey = process.env.NEXT_PUBLIC_ALGOLIA_SEARCH_API_KEY;
+
+              if (!appId || !apiKey) {
+                console.log('⚠️  Algolia credentials not found, database search will be disabled');
+                return null;
+              }
+
+              algoliaClient = algoliasearch(appId, apiKey);
+              console.log('✅ Algolia client initialized');
+            }
+            return algoliaClient;
+          }
 
           function cleanText(text) {
             if (!text) return '';
@@ -91,31 +112,42 @@ jobs:
 
           async function searchGameInDatabase(gameName) {
             try {
-              const { PrismaClient } = require('@prisma/client');
-              const prisma = new PrismaClient();
+              const client = getAlgoliaClient();
+              if (!client) {
+                console.log('  ⚠️  Algolia not available, skipping database search');
+                return null;
+              }
 
+              // Clean the game name (remove online-fix, parentheses)
               const cleanName = gameName
                 .replace(/\s*-?\s*online[-\s]?fix/gi, '')
                 .replace(/\s*online\s*/gi, ' ')
                 .replace(/\([^)]*\)/g, '')
                 .trim();
 
-              let game = await prisma.game.findFirst({
-                where: { name: { equals: cleanName, mode: 'insensitive' } },
-                select: { appid: true, name: true },
+              console.log(`  🔍 Searching Algolia for: "${cleanName}"`);
+
+              // Search using Algolia - it handles fuzzy matching automatically
+              const searchResult = await client.searchSingleIndex({
+                indexName: algoliaIndexName,
+                searchParams: {
+                  query: cleanName,
+                  hitsPerPage: 5,
+                  // Enable typo tolerance for better fuzzy matching
+                  typoTolerance: true,
+                },
               });
 
-              if (!game) {
-                game = await prisma.game.findFirst({
-                  where: { name: { contains: cleanName, mode: 'insensitive' } },
-                  select: { appid: true, name: true },
-                });
+              if (searchResult.hits && searchResult.hits.length > 0) {
+                const topHit = searchResult.hits[0];
+                console.log(`  ✅ Found via Algolia: "${topHit.name}" (AppID: ${topHit.appid})`);
+                return topHit.appid;
               }
 
-              await prisma.$disconnect();
-              return game?.appid || null;
+              console.log(`  ⚠️  No match found in Algolia for "${cleanName}"`);
+              return null;
             } catch (error) {
-              console.log(`Database search error: ${error.message}`);
+              console.log(`  ❌ Algolia search error: ${error.message}`);
               return null;
             }
           }
@@ -486,6 +518,108 @@ jobs:
           ONLINE_FIX_CF_CLEARANCE: ${{ secrets.ONLINE_FIX_CF_CLEARANCE }}
           MAX_PAGES: ${{ github.event.inputs.pages || '2' }}
           FETCH_APPIDS: ${{ github.event.inputs.fetch_appids || 'true' }}
+          NEXT_PUBLIC_ALGOLIA_APP_ID: ${{ secrets.NEXT_PUBLIC_ALGOLIA_APP_ID }}
+          NEXT_PUBLIC_ALGOLIA_SEARCH_API_KEY: ${{ secrets.NEXT_PUBLIC_ALGOLIA_SEARCH_API_KEY }}
+          NEXT_PUBLIC_ALGOLIA_INDEX_NAME: ${{ secrets.NEXT_PUBLIC_ALGOLIA_INDEX_NAME || 'games' }}
+
+      - name: Export onlineFixes table to JSON
+        id: export
+        run: |
+          # Create export script
+          cat > export-online-fixes.js << 'EOF'
+          const { PrismaClient } = require('@prisma/client');
+          const fs = require('fs');
+
+          async function exportOnlineFixesTable() {
+            const prisma = new PrismaClient();
+
+            try {
+              console.log('📥 Fetching data from onlineFixes table...');
+
+              const onlineFixes = await prisma.onlineFixes.findMany({
+                select: {
+                  appid: true,
+                  category: true,
+                  forMembership: true,
+                  created_at: true,
+                  updated_at: true,
+                  games: {
+                    select: {
+                      name: true,
+                    }
+                  },
+                },
+                orderBy: {
+                  updated_at: 'desc',
+                },
+              });
+
+              console.log(`✅ Fetched ${onlineFixes.length} records`);
+
+              // Calculate statistics
+              const stats = {
+                totalGames: onlineFixes.length,
+                categories: {},
+                membershipGames: onlineFixes.filter(g => g.forMembership).length,
+              };
+
+              onlineFixes.forEach(game => {
+                const cat = game.category || 'UNKNOWN';
+                stats.categories[cat] = (stats.categories[cat] || 0) + 1;
+              });
+
+              // Create output data
+              const output = {
+                version: new Date().toISOString(),
+                exportedAt: new Date().toISOString(),
+                source: 'onlineFixes table',
+                stats,
+                games: onlineFixes.map(fix => ({
+                  appid: fix.appid,
+                  name: fix.games?.name || null,
+                  category: fix.category,
+                  forMembership: fix.forMembership,
+                  createdAt: fix.created_at,
+                  updatedAt: fix.updated_at,
+                })),
+              };
+
+              // Write files
+              fs.writeFileSync('online-fixes-export.json', JSON.stringify(output, null, 2));
+              fs.writeFileSync('online-fixes-export.min.json', JSON.stringify(output));
+              fs.writeFileSync('online-fixes-stats.json', JSON.stringify({
+                version: output.version,
+                exportedAt: output.exportedAt,
+                source: output.source,
+                stats: output.stats,
+              }, null, 2));
+
+              console.log('✅ Export complete');
+              console.log(`   Total: ${stats.totalGames} games`);
+
+              return stats.totalGames;
+            } catch (error) {
+              console.error('❌ Export failed:', error.message);
+              throw error;
+            } finally {
+              await prisma.$disconnect();
+            }
+          }
+
+          exportOnlineFixesTable().catch(console.error);
+          EOF
+
+          # Run export
+          node export-online-fixes.js
+
+          # Extract stats for output
+          EXPORTED_GAMES=$(node -e "const data = require('./online-fixes-export.json'); console.log(data.stats.totalGames || 0);")
+          EXPORTED_AT=$(node -e "const data = require('./online-fixes-export.json'); console.log(data.exportedAt || '');")
+
+          echo "EXPORTED_GAMES=${EXPORTED_GAMES}" >> $GITHUB_OUTPUT
+          echo "EXPORTED_AT=${EXPORTED_AT}" >> $GITHUB_OUTPUT
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
       - name: Delete old release assets
         run: |
@@ -509,43 +643,69 @@ jobs:
           body: |
             🎮 Online-Fix Games Database
 
-            **Stats:**
-            - Total Games: ${{ steps.scrape.outputs.TOTAL_GAMES }}
-            - Total Pages: ${{ github.event.inputs.pages || '5' }}
-            - Updated: ${{ steps.scrape.outputs.LAST_UPDATED }}
+            **Scraping Stats:**
+            - Total Games Scraped: ${{ steps.scrape.outputs.TOTAL_GAMES }}
+            - Total Pages: ${{ github.event.inputs.pages || '2' }}
+            - Last Updated: ${{ steps.scrape.outputs.LAST_UPDATED }}
             - AppIDs Included: ${{ github.event.inputs.fetch_appids || 'true' }}
 
-            **Files:**
-            - `online-fix-games.json` - Formatted JSON with all games
-            - `online-fix-games.min.json` - Minified JSON
+            **Database Export Stats:**
+            - Total Games in DB: ${{ steps.export.outputs.EXPORTED_GAMES }}
+            - Exported At: ${{ steps.export.outputs.EXPORTED_AT }}
+
+            **Scraping Files:**
+            - `online-fix-games.json` - Formatted JSON with scraped games
+            - `online-fix-games.min.json` - Minified JSON (scraped games)
             - `online-fix-version.json` - Version information only
+
+            **Database Export Files:**
+            - `online-fixes-export.json` - Formatted JSON from onlineFixes table
+            - `online-fixes-export.min.json` - Minified JSON from onlineFixes table
+            - `online-fixes-stats.json` - Statistics only
 
             **Usage:**
             ```javascript
-            // Fetch all games
-            const data = await fetch('https://github.com/mejikuhibiniu1/workflow-releases/releases/download/online-fix-games/online-fix-games.json')
+            // Fetch scraped games (from online-fix.me)
+            const scrapedData = await fetch('https://github.com/mejikuhibiniu1/workflow-releases/releases/download/online-fix-games/online-fix-games.json')
               .then(res => res.json());
+            console.log(`Scraped games: ${scrapedData.totalGames}`);
 
-            console.log(`Total games: ${data.totalGames}`);
-            console.log(`Games:`, data.games);
+            // Fetch database export (from onlineFixes table)
+            const dbData = await fetch('https://github.com/mejikuhibiniu1/workflow-releases/releases/download/online-fix-games/online-fixes-export.json')
+              .then(res => res.json());
+            console.log(`DB games: ${dbData.stats.totalGames}`);
 
-            // Check version
-            const version = await fetch('https://github.com/mejikuhibiniu1/workflow-releases/releases/download/online-fix-games/online-fix-version.json')
+            // Check stats only
+            const stats = await fetch('https://github.com/mejikuhibiniu1/workflow-releases/releases/download/online-fix-games/online-fixes-stats.json')
               .then(res => res.json());
             ```
 
-            **Data Structure:**
+            **Scraped Data Structure:**
             ```json
             {
-              "version": "2025-10-25T10:00:00.000Z",
-              "totalPages": 5,
-              "totalGames": 100,
-              "lastUpdated": "2025-10-25T10:00:00.000Z",
+              "version": "2025-10-31T10:00:00.000Z",
+              "totalGames": 50,
               "games": [
                 {
                   "title": "Game Name",
-                  "link": "https://online-fix.me/games/...",
+                  "link": "https://online-fix.me/...",
                   "appid": "123456"
+                }
+              ]
+            }
+            ```
+
+            **Database Export Structure:**
+            ```json
+            {
+              "version": "2025-10-31T10:00:00.000Z",
+              "stats": { "totalGames": 500, "categories": {...} },
+              "games": [
+                {
+                  "appid": "123456",
+                  "name": "Game Name",
+                  "category": "WEB_ONLINE_FIX",
+                  "forMembership": false
                 }
               ]
             }
@@ -554,6 +714,9 @@ jobs:
             online-fix-games.json
             online-fix-games.min.json
             online-fix-version.json
+            online-fixes-export.json
+            online-fixes-export.min.json
+            online-fixes-stats.json
           prerelease: false
           make_latest: false
         env:

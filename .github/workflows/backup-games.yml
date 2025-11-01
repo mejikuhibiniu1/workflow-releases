@@ -116,6 +116,20 @@ jobs:
               };
               fs.writeFileSync('version.json', JSON.stringify(versionInfo, null, 2));
 
+              // Create latest 1000 games based on ID (from existing games data)
+              const latest1000Games = [...games]
+                .sort((a, b) => b.id - a.id)
+                .slice(0, 1000);
+
+              const latest1000Data = {
+                version: new Date().toISOString(),
+                totalGames: latest1000Games.length,
+                lastUpdated: new Date().toISOString(),
+                games: latest1000Games
+              };
+              fs.writeFileSync('games-latest-1000.json', JSON.stringify(latest1000Data, null, 2));
+              fs.writeFileSync('games-latest-1000.min.json', JSON.stringify(latest1000Data));
+
               // Extract and create genres.json
               const genresMap = new Map();
               games.forEach(game => {
@@ -178,7 +192,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           tag_name: games-database
-          name: "Games Database"
+          name: 'Games Database'
           body: |
             🎮 Games Database Export
 
@@ -189,13 +203,20 @@ jobs:
             **Files:**
             - `${{ env.filename }}` - Formatted JSON (timestamped)
             - `${{ env.filename_min }}` - Minified JSON (timestamped)
-            - `games-latest.json` - Always latest version
+            - `games-latest.json` - Always latest version (all games)
+            - `games-latest-1000.json` - Latest 1000 games by ID (formatted)
+            - `games-latest-1000.min.json` - Latest 1000 games by ID (minified)
             - `version.json` - Version information only
             - `genres.json` - All genres with game counts
 
             **Usage:**
             ```javascript
+            // Get all games
             const games = await fetch('https://github.com/mejikuhibiniu1/workflow-releases/releases/download/games-database/games-latest.json')
+              .then(res => res.json());
+
+            // Get latest 1000 games
+            const latest1000 = await fetch('https://github.com/mejikuhibiniu1/workflow-releases/releases/download/games-database/games-latest-1000.json')
               .then(res => res.json());
 
             // Check version
@@ -210,6 +231,8 @@ jobs:
             ${{ env.filename }}
             ${{ env.filename_min }}
             games-latest.json
+            games-latest-1000.json
+            games-latest-1000.min.json
             version.json
             genres.json
           prerelease: false
